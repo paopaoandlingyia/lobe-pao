@@ -1,6 +1,6 @@
 'use client';
 
-import { ChatItem } from '@lobehub/ui';
+import { ChatItem } from '@lobehub/ui/chat';
 import { createStyles } from 'antd-style';
 import isEqual from 'fast-deep-equal';
 import { MouseEventHandler, ReactNode, memo, use, useCallback, useMemo } from 'react';
@@ -171,6 +171,7 @@ const Item = memo<ChatListItemProps>(
 
     const markdownProps = useMemo(
       () => ({
+        animated: generating,
         citations: item?.role === 'user' ? undefined : item?.search?.citations,
         components,
         customRender: markdownCustomRender,
@@ -186,7 +187,7 @@ const Item = memo<ChatListItemProps>(
               // if the citations's url and title are all the same, we should not show the citations
               item?.search?.citations.every((item) => item.title !== item.url),
       }),
-      [components, markdownCustomRender, item?.role, item?.search],
+      [generating, components, markdownCustomRender, item?.role, item?.search],
     );
 
     const onChange = useCallback((value: string) => updateMessageContent(id, value), [id]);
@@ -248,7 +249,7 @@ const Item = memo<ChatListItemProps>(
               renderMessage={renderMessage}
               text={text}
               time={item.updatedAt || item.createdAt}
-              type={type === 'chat' ? 'block' : 'pure'}
+              variant={type === 'chat' ? 'bubble' : 'docs'}
             />
             {endRender}
           </Flexbox>
