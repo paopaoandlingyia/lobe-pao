@@ -1,10 +1,20 @@
-import { ChatCitationItem, ModelSpeed, ModelTokensUsage } from '@/types/message';
+import type { Pricing } from 'model-bank';
+
+import { ChatCitationItem, ModelSpeed, ModelUsage } from '@/types/message';
 
 import { parseToolCalls } from '../../helpers';
 import { ChatStreamCallbacks } from '../../types';
 import { AgentRuntimeErrorType } from '../../types/error';
 import { safeParseJSON } from '../../utils/safeParseJSON';
 import { nanoid } from '../../utils/uuid';
+import type { ComputeChatCostOptions } from '../usageConverters/utils/computeChatCost';
+
+export type ChatPayloadForTransformStream = {
+  model?: string;
+  pricing?: Pricing;
+  pricingOptions?: ComputeChatCostOptions;
+  provider?: string;
+};
 
 /**
  * context in the stream to save temporarily data
@@ -50,7 +60,7 @@ export interface StreamContext {
     name: string;
   };
   toolIndex?: number;
-  usage?: ModelTokensUsage;
+  usage?: ModelUsage;
 }
 
 export interface StreamProtocolChunk {
@@ -166,8 +176,27 @@ export const convertIterableToStream = <T>(stream: AsyncIterable<T>) => {
 export const createSSEProtocolTransformer = (
   transformer: (chunk: any, stack: StreamContext) => StreamProtocolChunk | StreamProtocolChunk[],
   streamStack?: StreamContext,
-) =>
-  new TransformStream({
+  options?: { requireTerminalEvent?: boolean },
+) => {
+  let hasTerminalEvent = false;
+  const requireTerminalEvent = Boolean(options?.requireTerminalEvent);
+
+  return new TransformStream({
+    flush(controller) {
+      // If the upstream closes without sending a terminal event, emit a final error event
+      if (requireTerminalEvent && !hasTerminalEvent) {
+        const id = streamStack?.id || 'stream_end';
+        const data = {
+          body: { name: 'Stream parsing error', reason: 'unexpected_end' },
+          message: 'Stream ended unexpectedly',
+          name: 'Stream parsing error',
+          type: 'StreamChunkError',
+        };
+        controller.enqueue(`id: ${id}\n`);
+        controller.enqueue(`event: error\n`);
+        controller.enqueue(`data: ${JSON.stringify(data)}\n\n`);
+      }
+    },
     transform: (chunk, controller) => {
       const result = transformer(chunk, streamStack || { id: '' });
 
@@ -177,15 +206,20 @@ export const createSSEProtocolTransformer = (
         controller.enqueue(`id: ${id}\n`);
         controller.enqueue(`event: ${type}\n`);
         controller.enqueue(`data: ${JSON.stringify(data)}\n\n`);
+
+        // mark terminal when receiving any of these events
+        if (type === 'stop' || type === 'usage' || type === 'error') hasTerminalEvent = true;
       });
     },
   });
+};
 
 export function createCallbacksTransformer(cb: ChatStreamCallbacks | undefined) {
   const textEncoder = new TextEncoder();
   let aggregatedText = '';
   let aggregatedThinking: string | undefined = undefined;
-  let usage: ModelTokensUsage | undefined;
+  let usage: ModelUsage | undefined;
+  let speed: ModelSpeed | undefined;
   let grounding: any;
   let toolsCalling: any;
 
@@ -196,6 +230,7 @@ export function createCallbacksTransformer(cb: ChatStreamCallbacks | undefined) 
     async flush(): Promise<void> {
       const data = {
         grounding,
+        speed,
         text: aggregatedText,
         thinking: aggregatedThinking,
         toolsCalling,
@@ -250,6 +285,11 @@ export function createCallbacksTransformer(cb: ChatStreamCallbacks | undefined) 
           case 'usage': {
             usage = data;
             await callbacks.onUsage?.(data);
+            break;
+          }
+
+          case 'speed': {
+            speed = data;
             break;
           }
 
@@ -337,10 +377,13 @@ export const TOKEN_SPEED_CHUNK_ID = 'output_speed';
  */
 export const createTokenSpeedCalculator = (
   transformer: (chunk: any, stack: StreamContext) => StreamProtocolChunk | StreamProtocolChunk[],
-  { inputStartAt, streamStack }: { inputStartAt?: number; streamStack?: StreamContext } = {},
+  {
+    inputStartAt,
+    streamStack,
+    enableStreaming = true, // 选择 TPS 计算方式（非流式时传 false）
+  }: { enableStreaming?: boolean; inputStartAt?: number; streamStack?: StreamContext } = {},
 ) => {
   let outputStartAt: number | undefined;
-  let outputThinking: boolean | undefined;
 
   const process = (chunk: StreamProtocolChunk) => {
     let result = [chunk];
@@ -349,33 +392,25 @@ export const createTokenSpeedCalculator = (
       outputStartAt = Date.now();
     }
 
-    /**
-     * 部分 provider 在正式输出 reasoning 前，可能会先输出 content 为空字符串的 chunk，
-     * 其中 reasoning 可能为 null，会导致判断是否输出思考内容错误，所以过滤掉 null 或者空字符串。
-     * 也可能是某些特殊 token，所以不修改 outputStartAt 的逻辑。
-     */
-    if (
-      outputThinking === undefined &&
-      (chunk.type === 'text' || chunk.type === 'reasoning') &&
-      typeof chunk.data === 'string' &&
-      chunk.data.length > 0
-    ) {
-      outputThinking = chunk.type === 'reasoning';
-    }
     // if the chunk is the stop chunk, set as output finish
     if (inputStartAt && outputStartAt && chunk.type === 'usage') {
-      const totalOutputTokens =
-        chunk.data?.totalOutputTokens ??
-        (chunk.data?.outputTextTokens ?? 0) + (chunk.data?.outputImageTokens ?? 0);
-      const reasoningTokens = chunk.data?.outputReasoningTokens ?? 0;
-      const outputTokens =
-        (outputThinking ?? false)
-          ? totalOutputTokens
-          : Math.max(0, totalOutputTokens - reasoningTokens);
+      // TPS should always include all generated tokens (including reasoning tokens)
+      // because it measures generation speed, not just visible content
+      const usage = chunk.data as ModelUsage;
+      const outputTokens = usage?.totalOutputTokens ?? 0;
+      const now = Date.now();
+      const elapsed = now - (enableStreaming ? outputStartAt : inputStartAt);
+      const duration = now - outputStartAt;
+      const latency = now - inputStartAt;
+      const ttft = outputStartAt - inputStartAt;
+      const tps = elapsed === 0 ? undefined : (outputTokens / elapsed) * 1000;
+
       result.push({
         data: {
-          tps: (outputTokens / (Date.now() - outputStartAt)) * 1000,
-          ttft: outputStartAt - inputStartAt,
+          duration,
+          latency,
+          tps,
+          ttft,
         } as ModelSpeed,
         id: TOKEN_SPEED_CHUNK_ID,
         type: 'speed',

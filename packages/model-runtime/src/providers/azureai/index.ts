@@ -1,16 +1,18 @@
 import createClient, { ModelClient } from '@azure-rest/ai-inference';
 import { AzureKeyCredential } from '@azure/core-auth';
+import { ModelProvider } from 'model-bank';
 import OpenAI from 'openai';
 
 import { systemToUserModels } from '../../const/models';
 import { LobeRuntimeAI } from '../../core/BaseAI';
 import { transformResponseToStream } from '../../core/openaiCompatibleFactory';
 import { OpenAIStream, createSSEDataExtractor } from '../../core/streams';
-import { ChatMethodOptions, ChatStreamPayload, ModelProvider } from '../../types';
+import { ChatMethodOptions, ChatStreamPayload } from '../../types';
 import { AgentRuntimeErrorType } from '../../types/error';
 import { AgentRuntimeError } from '../../utils/createError';
 import { debugStream } from '../../utils/debugStream';
 import { StreamingResponse } from '../../utils/response';
+import { sanitizeError } from '../../utils/sanitizeError';
 
 interface AzureAIParams {
   apiKey?: string;
@@ -83,9 +85,12 @@ export class LobeAzureAI implements LobeRuntimeAI {
 
         // the azure AI inference response is openai compatible
         const stream = transformResponseToStream(res.body as OpenAI.ChatCompletion);
-        return StreamingResponse(OpenAIStream(stream, { callbacks: options?.callback }), {
-          headers: options?.headers,
-        });
+        return StreamingResponse(
+          OpenAIStream(stream, { callbacks: options?.callback, enableStreaming: false }),
+          {
+            headers: options?.headers,
+          },
+        );
       }
     } catch (e) {
       let error = e as { [key: string]: any; code: string; message: string };
@@ -108,9 +113,12 @@ export class LobeAzureAI implements LobeRuntimeAI {
         ? AgentRuntimeErrorType.ProviderBizError
         : AgentRuntimeErrorType.AgentRuntimeError;
 
+      // Sanitize error to remove sensitive information like API keys from headers
+      const sanitizedError = sanitizeError(error);
+
       throw AgentRuntimeError.chat({
         endpoint: this.maskSensitiveUrl(this.baseURL),
-        error,
+        error: sanitizedError,
         errorType,
         provider: ModelProvider.Azure,
       });

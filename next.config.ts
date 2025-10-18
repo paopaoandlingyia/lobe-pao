@@ -1,5 +1,4 @@
 import analyzer from '@next/bundle-analyzer';
-import { withSentryConfig } from '@sentry/nextjs';
 import withSerwistInit from '@serwist/next';
 import type { NextConfig } from 'next';
 import ReactComponentName from 'react-scan/react-component-name/webpack';
@@ -20,8 +19,11 @@ const standaloneConfig: NextConfig = {
   outputFileTracingIncludes: { '*': ['public/**/*', '.next/static/**/*'] },
 };
 
+const assetPrefix = process.env.NEXT_PUBLIC_ASSET_PREFIX;
+
 const nextConfig: NextConfig = {
   ...(isStandaloneMode ? standaloneConfig : {}),
+  assetPrefix,
   compiler: {
     emotion: true,
   },
@@ -245,22 +247,21 @@ const nextConfig: NextConfig = {
       permanent: true,
       source: '/discover/providers',
     },
+    // {
+    //   destination: '/settings/common',
+    //   permanent: true,
+    //   source: '/settings',
+    // },
     {
-      destination: '/settings/common',
-      permanent: true,
-      source: '/settings',
+      destination: '/chat',
+      permanent: false,
+      source: '/',
     },
     {
       destination: '/chat',
       permanent: true,
       source: '/welcome',
     },
-    // TODO: 等 V2 做强制跳转吧
-    // {
-    //   destination: '/settings/provider/volcengine',
-    //   permanent: true,
-    //   source: '/settings/provider/doubao',
-    // },
     // we need back /repos url in the further
     {
       destination: '/files',
@@ -272,6 +273,7 @@ const nextConfig: NextConfig = {
   // when external packages in dev mode with turbopack, this config will lead to bundle error
   serverExternalPackages: isProd ? ['@electric-sql/pglite'] : undefined,
   transpilePackages: ['pdfjs-dist', 'mermaid'],
+
   typescript: {
     ignoreBuildErrors: true,
   },
@@ -309,6 +311,20 @@ const nextConfig: NextConfig = {
       zipfile: false,
     };
 
+    if (assetPrefix && (assetPrefix.startsWith('http://') || assetPrefix.startsWith('https://'))) {
+      // fix the Worker URL cross-origin issue
+      // refs: https://github.com/lobehub/lobe-chat/pull/9624
+      config.module.rules.push({
+        generator: {
+          // @see https://webpack.js.org/configuration/module/#rulegeneratorpublicpath
+          publicPath: '/_next/',
+        },
+        test: /worker\.ts$/,
+        // @see https://webpack.js.org/guides/asset-modules/
+        type: 'asset/resource',
+      });
+    }
+
     return config;
   },
 };
@@ -326,48 +342,4 @@ const withPWA =
       })
     : noWrapper;
 
-const hasSentry = !!process.env.NEXT_PUBLIC_SENTRY_DSN;
-const withSentry =
-  isProd && hasSentry
-    ? (c: NextConfig) =>
-        withSentryConfig(
-          c,
-          {
-            org: process.env.SENTRY_ORG,
-
-            project: process.env.SENTRY_PROJECT,
-            // For all available options, see:
-            // https://github.com/getsentry/sentry-webpack-plugin#options
-            // Suppresses source map uploading logs during build
-            silent: true,
-          },
-          {
-            // Enables automatic instrumentation of Vercel Cron Monitors.
-            // See the following for more information:
-            // https://docs.sentry.io/product/crons/
-            // https://vercel.com/docs/cron-jobs
-            automaticVercelMonitors: true,
-
-            // Automatically tree-shake Sentry logger statements to reduce bundle size
-            disableLogger: true,
-
-            // Hides source maps from generated client bundles
-            hideSourceMaps: true,
-
-            // Transpiles SDK to be compatible with IE11 (increases bundle size)
-            transpileClientSDK: true,
-
-            // Routes browser requests to Sentry through a Next.js rewrite to circumvent ad-blockers. (increases server load)
-            // Note: Check that the configured route will not match with your Next.js middleware, otherwise reporting of client-
-            // side errors will fail.
-            tunnelRoute: '/monitoring',
-
-            // For all available options, see:
-            // https://docs.sentry.io/platforms/javascript/guides/nextjs/manual-setup/
-            // Upload a larger set of source maps for prettier stack traces (increases build time)
-            widenClientFileUpload: true,
-          },
-        )
-    : noWrapper;
-
-export default withBundleAnalyzer(withPWA(withSentry(nextConfig) as NextConfig));
+export default withBundleAnalyzer(withPWA(nextConfig as NextConfig));

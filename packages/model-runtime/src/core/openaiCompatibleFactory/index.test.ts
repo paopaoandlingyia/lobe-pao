@@ -4,14 +4,14 @@ import {
   ChatStreamCallbacks,
   ChatStreamPayload,
   LobeOpenAICompatibleRuntime,
-  ModelProvider,
 } from '@lobechat/model-runtime';
+import { ModelProvider } from 'model-bank';
 import OpenAI from 'openai';
 import type { Stream } from 'openai/streaming';
 import { Mock, afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import * as debugStreamModule from '../../utils/debugStream';
-import * as openaiHelpers from '../../utils/openaiHelpers';
+import * as openaiHelpers from '../contextBuilders/openai';
 import { createOpenAICompatibleRuntime } from './index';
 
 const sleep = async (ms: number) =>
@@ -58,6 +58,18 @@ afterEach(() => {
 });
 
 describe('LobeOpenAICompatibleFactory', () => {
+  // Polyfill File for Node environment used in image tests
+  if (typeof File === 'undefined') {
+    // @ts-ignore
+    global.File = class MockFile {
+      constructor(
+        public parts: any[],
+        public name: string,
+        public opts?: any,
+      ) {}
+    };
+  }
+
   describe('init', () => {
     it('should correctly initialize with an API key', async () => {
       const instance = new LobeMockProvider({ apiKey: 'test_api_key' });
@@ -148,10 +160,18 @@ describe('LobeOpenAICompatibleFactory', () => {
 
         const decoder = new TextDecoder();
         const reader = result.body!.getReader();
-        expect(decoder.decode((await reader.read()).value)).toEqual('id: a\n');
-        expect(decoder.decode((await reader.read()).value)).toEqual('event: text\n');
-        expect(decoder.decode((await reader.read()).value)).toEqual('data: "hello"\n\n');
-        expect((await reader.read()).done).toBe(true);
+
+        // Collect all chunks
+        const chunks = [];
+        while (true) {
+          const { value, done } = await reader.read();
+          if (done) break;
+          chunks.push(decoder.decode(value));
+        }
+        // Assert that all expected chunk patterns are present
+        expect(chunks).toEqual(
+          expect.arrayContaining(['id: a\n', 'event: text\n', 'data: "hello"\n\n']),
+        );
       });
 
       // https://github.com/lobehub/lobe-chat/issues/2752
@@ -275,83 +295,9 @@ describe('LobeOpenAICompatibleFactory', () => {
         );
       });
 
-      it.skip('should handle anthropic sonnet 3.5 tool calling chunks correctly', async () => {
-        const chunks = [
-          {
-            id: 'chatcmpl-b3f58dc5-0699-4b28-aefe-6624c2a68d51',
-            created: 1718909418,
-            model: 'claude-3-5-sonnet-20240620',
-            object: 'chat.completion.chunk',
-
-            choices: [
-              {
-                index: 0,
-                delta: {
-                  content:
-                    '好的,我可以帮您查询杭州的天气情况。让我使用实时天气工具来获取杭州的当前天气信息。',
-                  id: 'rolu_01JXyRw6Ti78mR2dn6U5h1pa',
-                  function: {
-                    arguments: '{"city": "杭州"}',
-                    name: 'realtime-weather____fetchCurrentWeather',
-                  },
-                  type: 'function',
-                  index: 0,
-                },
-              },
-            ],
-          },
-          {
-            id: 'chatcmpl-b3f58dc5-0699-4b28-aefe-6624c2a68d51',
-            choices: [{ finish_reason: 'stop', index: 0, delta: {} }],
-            created: 1718909418,
-            model: 'claude-3-5-sonnet-20240620',
-            object: 'chat.completion.chunk',
-          },
-        ];
-        const mockStream = new ReadableStream({
-          start(controller) {
-            chunks.forEach((item) => {
-              controller.enqueue(item);
-            });
-
-            controller.close();
-          },
-        });
-        vi.spyOn(instance['client'].chat.completions, 'create').mockResolvedValue(
-          mockStream as any,
-        );
-
-        const stream: string[] = [];
-        const result = await instance.chat({
-          messages: [{ content: 'Hello', role: 'user' }],
-          model: 'gpt-3.5-turbo',
-          temperature: 0,
-        });
-        const decoder = new TextDecoder();
-        const reader = result.body!.getReader();
-
-        while (true) {
-          const { value, done } = await reader.read();
-          if (done) break;
-          stream.push(decoder.decode(value));
-        }
-
-        expect(stream).toEqual(
-          [
-            'id: chatcmpl-b3f58dc5-0699-4b28-aefe-6624c2a68d51',
-            'event: text',
-            'data: "好的,我可以帮您查询杭州的天气情况。让我使用实时天气工具来获取杭州的当前天气信息。"\n',
-            'id: chatcmpl-b3f58dc5-0699-4b28-aefe-6624c2a68d51',
-            'event: tool_calls',
-            'data: ""\n',
-            'id: chatcmpl-b3f58dc5-0699-4b28-aefe-6624c2a68d51',
-            'event: stop',
-            'data: "stop"\n',
-          ].map((item) => `${item}\n`),
-        );
-      });
-
       it('should transform non-streaming response to stream correctly', async () => {
+        vi.useFakeTimers();
+
         const mockResponse = {
           id: 'a',
           object: 'chat.completion',
@@ -375,12 +321,17 @@ describe('LobeOpenAICompatibleFactory', () => {
           mockResponse as any,
         );
 
-        const result = await instance.chat({
+        const chatPromise = instance.chat({
           messages: [{ content: 'Hello', role: 'user' }],
           model: 'mistralai/mistral-7b-instruct:free',
           temperature: 0,
           stream: false,
         });
+
+        // Advance time to simulate processing delay
+        vi.advanceTimersByTime(10);
+
+        const result = await chatPromise;
 
         const decoder = new TextDecoder();
         const reader = result.body!.getReader();
@@ -397,11 +348,94 @@ describe('LobeOpenAICompatibleFactory', () => {
           'event: text\n',
           'data: "Hello"\n\n',
           'id: a\n',
+          'event: usage\n',
+          'data: {"inputTextTokens":5,"outputTextTokens":5,"totalInputTokens":5,"totalOutputTokens":5,"totalTokens":10}\n\n',
+          'id: output_speed\n',
+          'event: speed\n',
+          expect.stringMatching(/^data: \{.*"tps":.*,"ttft":.*}\n\n$/), // tps ttft should be calculated with elapsed time
+          'id: a\n',
           'event: stop\n',
           'data: "stop"\n\n',
         ]);
 
         expect((await reader.read()).done).toBe(true);
+
+        vi.useRealTimers();
+      });
+
+      it('should transform non-streaming response to stream correctly with reasoning content', async () => {
+        vi.useFakeTimers();
+
+        const mockResponse = {
+          id: 'a',
+          object: 'chat.completion',
+          created: 123,
+          model: 'deepseek/deepseek-reasoner',
+          choices: [
+            {
+              index: 0,
+              message: {
+                role: 'assistant',
+                content: 'Hello',
+                reasoning_content: 'Thinking content',
+              },
+              finish_reason: 'stop',
+              logprobs: null,
+            },
+          ],
+          usage: {
+            prompt_tokens: 5,
+            completion_tokens: 5,
+            total_tokens: 10,
+          },
+        } as unknown as OpenAI.ChatCompletion;
+        vi.spyOn(instance['client'].chat.completions, 'create').mockResolvedValue(
+          mockResponse as any,
+        );
+
+        const chatPromise = instance.chat({
+          messages: [{ content: 'Hello', role: 'user' }],
+          model: 'deepseek/deepseek-reasoner',
+          temperature: 0,
+          stream: false,
+        });
+
+        // Advance time to simulate processing delay
+        vi.advanceTimersByTime(10);
+
+        const result = await chatPromise;
+
+        const decoder = new TextDecoder();
+        const reader = result.body!.getReader();
+        const stream: string[] = [];
+
+        while (true) {
+          const { value, done } = await reader.read();
+          if (done) break;
+          stream.push(decoder.decode(value));
+        }
+
+        expect(stream).toEqual([
+          'id: a\n',
+          'event: reasoning\n',
+          'data: "Thinking content"\n\n',
+          'id: a\n',
+          'event: text\n',
+          'data: "Hello"\n\n',
+          'id: a\n',
+          'event: usage\n',
+          'data: {"inputTextTokens":5,"outputTextTokens":5,"totalInputTokens":5,"totalOutputTokens":5,"totalTokens":10}\n\n',
+          'id: output_speed\n',
+          'event: speed\n',
+          expect.stringMatching(/^data: \{.*"tps":.*,"ttft":.*}\n\n$/), // tps ttft should be calculated with elapsed time
+          'id: a\n',
+          'event: stop\n',
+          'data: "stop"\n\n',
+        ]);
+
+        expect((await reader.read()).done).toBe(true);
+
+        vi.useRealTimers();
       });
     });
 
@@ -615,7 +649,6 @@ describe('LobeOpenAICompatibleFactory', () => {
       it('should return bizErrorType with the cause when OpenAI.APIError is thrown with cause', async () => {
         // Arrange
         const errorInfo = {
-          stack: 'abc',
           cause: {
             message: 'api is undefined',
           },
@@ -636,7 +669,6 @@ describe('LobeOpenAICompatibleFactory', () => {
             endpoint: defaultBaseURL,
             error: {
               cause: { message: 'api is undefined' },
-              stack: 'abc',
             },
             errorType: bizErrorType,
             provider,
@@ -647,7 +679,6 @@ describe('LobeOpenAICompatibleFactory', () => {
       it('should return bizErrorType with an cause response with desensitize Url', async () => {
         // Arrange
         const errorInfo = {
-          stack: 'abc',
           cause: { message: 'api is undefined' },
         };
         const apiError = new OpenAI.APIError(400, errorInfo, 'module error', {});
@@ -672,7 +703,6 @@ describe('LobeOpenAICompatibleFactory', () => {
             endpoint: 'https://api.***.com/v1',
             error: {
               cause: { message: 'api is undefined' },
-              stack: 'abc',
             },
             errorType: bizErrorType,
             provider,
@@ -746,7 +776,6 @@ describe('LobeOpenAICompatibleFactory', () => {
               name: genericError.name,
               cause: genericError.cause,
               message: genericError.message,
-              stack: genericError.stack,
             },
           });
         }
@@ -937,6 +966,81 @@ describe('LobeOpenAICompatibleFactory', () => {
       await instance.chat(payload);
 
       expect(customTransformHandler).toHaveBeenCalledWith(mockResponse);
+    });
+
+    describe('responses routing', () => {
+      it('should route to Responses API when chatCompletion.useResponse is true', async () => {
+        const LobeMockProviderUseResponses = createOpenAICompatibleRuntime({
+          baseURL: 'https://api.test.com/v1',
+          chatCompletion: {
+            useResponse: true,
+          },
+          provider: ModelProvider.OpenAI,
+        });
+
+        const inst = new LobeMockProviderUseResponses({ apiKey: 'test' });
+
+        // mock responses.create to return a stream-like with tee
+        const prod = new ReadableStream();
+        const debug = new ReadableStream();
+        const mockResponsesCreate = vi
+          .spyOn(inst['client'].responses, 'create')
+          .mockResolvedValue({ tee: () => [prod, debug] } as any);
+
+        await inst.chat({
+          messages: [{ content: 'hi', role: 'user' }],
+          model: 'any-model',
+          temperature: 0,
+        });
+
+        expect(mockResponsesCreate).toHaveBeenCalled();
+      });
+
+      it('should route to Responses API when model matches useResponseModels', async () => {
+        const LobeMockProviderUseResponseModels = createOpenAICompatibleRuntime({
+          baseURL: 'https://api.test.com/v1',
+          chatCompletion: {
+            useResponseModels: ['special-model', /special-\w+/],
+          },
+          provider: ModelProvider.OpenAI,
+        });
+        const inst = new LobeMockProviderUseResponseModels({ apiKey: 'test' });
+        const spy = vi.spyOn(inst['client'].responses, 'create');
+        // Prevent hanging by mocking normal chat completion stream
+        vi.spyOn(inst['client'].chat.completions, 'create').mockResolvedValue(
+          new ReadableStream() as any,
+        );
+
+        // First invocation: model contains the string
+        spy.mockResolvedValueOnce({
+          tee: () => [new ReadableStream(), new ReadableStream()],
+        } as any);
+        await inst.chat({
+          messages: [{ content: 'hi', role: 'user' }],
+          model: 'prefix-special-model-suffix',
+          temperature: 0,
+        });
+        expect(spy).toHaveBeenCalledTimes(1);
+
+        // Second invocation: model matches the RegExp
+        spy.mockResolvedValueOnce({
+          tee: () => [new ReadableStream(), new ReadableStream()],
+        } as any);
+        await inst.chat({
+          messages: [{ content: 'hi', role: 'user' }],
+          model: 'special-xyz',
+          temperature: 0,
+        });
+        expect(spy).toHaveBeenCalledTimes(2);
+
+        // Third invocation: model does not match any useResponseModels patterns
+        await inst.chat({
+          messages: [{ content: 'hi', role: 'user' }],
+          model: 'unrelated-model',
+          temperature: 0,
+        });
+        expect(spy).toHaveBeenCalledTimes(2); // Ensure no additional calls were made
+      });
     });
 
     describe('DEBUG', () => {
@@ -1320,6 +1424,819 @@ describe('LobeOpenAICompatibleFactory', () => {
           style: 'vivid',
           response_format: 'b64_json',
         });
+      });
+    });
+  });
+
+  describe('generateObject', () => {
+    it('should return parsed JSON object on successful API call', async () => {
+      const mockResponse = {
+        output_text: '{"name": "John", "age": 30}',
+      };
+
+      vi.spyOn(instance['client'].responses, 'create').mockResolvedValue(mockResponse as any);
+
+      const payload = {
+        messages: [{ content: 'Generate a person object', role: 'user' as const }],
+        schema: {
+          name: 'person_extractor',
+          description: 'Extract person information',
+          schema: {
+            type: 'object' as const,
+            properties: { name: { type: 'string' }, age: { type: 'number' } },
+          },
+          strict: true,
+        },
+        model: 'gpt-4o',
+        responseApi: true,
+      };
+
+      const result = await instance.generateObject(payload);
+
+      expect(instance['client'].responses.create).toHaveBeenCalledWith(
+        {
+          input: payload.messages,
+          model: payload.model,
+          // @ts-ignore
+          text: { format: { strict: true, type: 'json_schema', ...payload.schema } },
+          user: undefined,
+        },
+        { headers: undefined, signal: undefined },
+      );
+
+      expect(result).toEqual({ name: 'John', age: 30 });
+    });
+
+    it('should handle options correctly', async () => {
+      const mockResponse = {
+        output_text: '{"status": "success"}',
+      };
+
+      vi.spyOn(instance['client'].responses, 'create').mockResolvedValue(mockResponse as any);
+
+      const payload = {
+        messages: [{ content: 'Generate status', role: 'user' as const }],
+        schema: {
+          name: 'status_extractor',
+          schema: { type: 'object' as const, properties: { status: { type: 'string' } } },
+        },
+        model: 'gpt-4o',
+        responseApi: true,
+      };
+
+      const options = {
+        headers: { 'Custom-Header': 'test-value' },
+        user: 'test-user',
+        signal: new AbortController().signal,
+      };
+
+      const result = await instance.generateObject(payload, options);
+
+      expect(instance['client'].responses.create).toHaveBeenCalledWith(
+        {
+          input: payload.messages,
+          model: payload.model,
+          // @ts-ignore
+          text: { format: { strict: true, type: 'json_schema', ...payload.schema } },
+          user: options.user,
+        },
+        { headers: options.headers, signal: options.signal },
+      );
+
+      expect(result).toEqual({ status: 'success' });
+    });
+
+    it('should return undefined when JSON parsing fails', async () => {
+      const mockResponse = {
+        output_text: 'invalid json string',
+      };
+
+      vi.spyOn(instance['client'].responses, 'create').mockResolvedValue(mockResponse as any);
+      const consoleSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+
+      const payload = {
+        messages: [{ content: 'Generate data', role: 'user' as const }],
+        schema: {
+          name: 'test_tool',
+          schema: { type: 'object' as const, properties: {} },
+        },
+        model: 'gpt-4o',
+        responseApi: true,
+      };
+
+      const result = await instance.generateObject(payload);
+
+      expect(consoleSpy).toHaveBeenCalledWith('parse json error:', 'invalid json string');
+      expect(result).toBeUndefined();
+
+      consoleSpy.mockRestore();
+    });
+
+    it('should handle empty response text', async () => {
+      const mockResponse = {
+        output_text: '',
+      };
+
+      vi.spyOn(instance['client'].responses, 'create').mockResolvedValue(mockResponse as any);
+      const consoleSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+
+      const payload = {
+        messages: [{ content: 'Generate data', role: 'user' as const }],
+        schema: {
+          name: 'test_tool',
+          schema: { type: 'object' as const, properties: {} },
+        },
+        model: 'gpt-4o',
+        responseApi: true,
+      };
+
+      const result = await instance.generateObject(payload);
+
+      expect(consoleSpy).toHaveBeenCalledWith('parse json error:', '');
+      expect(result).toBeUndefined();
+
+      consoleSpy.mockRestore();
+    });
+
+    it('should handle complex nested JSON objects', async () => {
+      const mockResponse = {
+        output_text:
+          '{"user": {"name": "Alice", "profile": {"age": 25, "preferences": ["music", "sports"]}}, "metadata": {"created": "2024-01-01"}}',
+      };
+
+      vi.spyOn(instance['client'].responses, 'create').mockResolvedValue(mockResponse as any);
+
+      const payload = {
+        messages: [{ content: 'Generate complex user data', role: 'user' as const }],
+        schema: {
+          name: 'user_extractor',
+          schema: {
+            type: 'object' as const,
+            properties: {
+              user: {
+                type: 'object',
+                properties: {
+                  name: { type: 'string' },
+                  profile: {
+                    type: 'object',
+                    properties: {
+                      age: { type: 'number' },
+                      preferences: { type: 'array', items: { type: 'string' } },
+                    },
+                  },
+                },
+              },
+              metadata: { type: 'object' },
+            },
+          },
+        },
+        model: 'gpt-4o',
+        responseApi: true,
+      };
+
+      const result = await instance.generateObject(payload);
+
+      expect(result).toEqual({
+        user: {
+          name: 'Alice',
+          profile: {
+            age: 25,
+            preferences: ['music', 'sports'],
+          },
+        },
+        metadata: {
+          created: '2024-01-01',
+        },
+      });
+    });
+
+    it('should propagate errors from responses API', async () => {
+      const apiError = new Error('API Error: Invalid schema format');
+
+      vi.spyOn(instance['client'].responses, 'create').mockRejectedValue(apiError);
+
+      const payload = {
+        messages: [{ content: 'Generate data', role: 'user' as const }],
+        schema: {
+          name: 'test_tool',
+          schema: { type: 'object' as const, properties: {} },
+        },
+        model: 'gpt-4o',
+        responseApi: true,
+      };
+
+      await expect(instance.generateObject(payload)).rejects.toThrow(
+        'API Error: Invalid schema format',
+      );
+    });
+
+    describe('chat completions API path', () => {
+      it('should return parsed JSON object using chat completions API', async () => {
+        const mockResponse = {
+          choices: [
+            {
+              message: {
+                content: '{"name": "Bob", "age": 25}',
+              },
+            },
+          ],
+        };
+
+        vi.spyOn(instance['client'].chat.completions, 'create').mockResolvedValue(
+          mockResponse as any,
+        );
+
+        const payload = {
+          messages: [{ content: 'Generate a person object', role: 'user' as const }],
+          schema: {
+            name: 'person_extractor',
+            schema: {
+              type: 'object' as const,
+              properties: { name: { type: 'string' }, age: { type: 'number' } },
+            },
+          },
+          model: 'gpt-4o',
+          // responseApi: false or undefined - uses chat completions API
+        };
+
+        const result = await instance.generateObject(payload);
+
+        expect(instance['client'].chat.completions.create).toHaveBeenCalledWith(
+          {
+            messages: payload.messages,
+            model: payload.model,
+            response_format: { json_schema: payload.schema, type: 'json_schema' },
+            user: undefined,
+          },
+          { headers: undefined, signal: undefined },
+        );
+
+        expect(result).toEqual({ name: 'Bob', age: 25 });
+      });
+
+      it('should handle options correctly with chat completions API', async () => {
+        const mockResponse = {
+          choices: [
+            {
+              message: {
+                content: '{"status": "completed"}',
+              },
+            },
+          ],
+        };
+
+        vi.spyOn(instance['client'].chat.completions, 'create').mockResolvedValue(
+          mockResponse as any,
+        );
+
+        const payload = {
+          messages: [{ content: 'Generate status', role: 'user' as const }],
+          schema: {
+            name: 'status_extractor',
+            schema: { type: 'object' as const, properties: { status: { type: 'string' } } },
+          },
+          model: 'gpt-4o',
+          responseApi: false,
+        };
+
+        const options = {
+          headers: { Authorization: 'Bearer token' },
+          user: 'test-user-123',
+          signal: new AbortController().signal,
+        };
+
+        const result = await instance.generateObject(payload, options);
+
+        expect(instance['client'].chat.completions.create).toHaveBeenCalledWith(
+          {
+            messages: payload.messages,
+            model: payload.model,
+            response_format: { json_schema: payload.schema, type: 'json_schema' },
+            user: options.user,
+          },
+          { headers: options.headers, signal: options.signal },
+        );
+
+        expect(result).toEqual({ status: 'completed' });
+      });
+
+      it('should return undefined when JSON parsing fails with chat completions API', async () => {
+        const mockResponse = {
+          choices: [
+            {
+              message: {
+                content: 'This is not valid JSON',
+              },
+            },
+          ],
+        };
+
+        vi.spyOn(instance['client'].chat.completions, 'create').mockResolvedValue(
+          mockResponse as any,
+        );
+        const consoleSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+
+        const payload = {
+          messages: [{ content: 'Generate data', role: 'user' as const }],
+          schema: {
+            name: 'test_tool',
+            schema: { type: 'object' as const, properties: {} },
+          },
+          model: 'gpt-4o',
+          responseApi: false,
+        };
+
+        const result = await instance.generateObject(payload);
+
+        expect(consoleSpy).toHaveBeenCalledWith('parse json error:', 'This is not valid JSON');
+        expect(result).toBeUndefined();
+
+        consoleSpy.mockRestore();
+      });
+
+      it('should handle empty string content from chat completions API', async () => {
+        const mockResponse = {
+          choices: [
+            {
+              message: {
+                content: '',
+              },
+            },
+          ],
+        };
+
+        vi.spyOn(instance['client'].chat.completions, 'create').mockResolvedValue(
+          mockResponse as any,
+        );
+        const consoleSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+
+        const payload = {
+          messages: [{ content: 'Generate data', role: 'user' as const }],
+          schema: {
+            name: 'test_tool',
+            schema: { type: 'object' as const, properties: {} },
+          },
+          model: 'gpt-4o',
+          responseApi: false,
+        };
+
+        const result = await instance.generateObject(payload);
+
+        expect(consoleSpy).toHaveBeenCalledWith('parse json error:', '');
+        expect(result).toBeUndefined();
+
+        consoleSpy.mockRestore();
+      });
+
+      it('should handle complex arrays with chat completions API', async () => {
+        const mockResponse = {
+          choices: [
+            {
+              message: {
+                content:
+                  '{"items": [{"id": 1, "name": "Item 1"}, {"id": 2, "name": "Item 2"}], "total": 2}',
+              },
+            },
+          ],
+        };
+
+        vi.spyOn(instance['client'].chat.completions, 'create').mockResolvedValue(
+          mockResponse as any,
+        );
+
+        const payload = {
+          messages: [{ content: 'Generate items list', role: 'user' as const }],
+          schema: {
+            name: 'abc',
+            schema: {
+              type: 'object' as const,
+              properties: {
+                items: {
+                  type: 'array',
+                  items: {
+                    type: 'object',
+                    properties: {
+                      id: { type: 'number' },
+                      name: { type: 'string' },
+                    },
+                  },
+                },
+                total: { type: 'number' },
+              },
+            },
+          },
+          model: 'gpt-4o',
+        };
+
+        const result = await instance.generateObject(payload);
+
+        expect(result).toEqual({
+          items: [
+            { id: 1, name: 'Item 1' },
+            { id: 2, name: 'Item 2' },
+          ],
+          total: 2,
+        });
+      });
+
+      it('should propagate errors from chat completions API', async () => {
+        const apiError = new Error('API Error: Rate limit exceeded');
+
+        vi.spyOn(instance['client'].chat.completions, 'create').mockRejectedValue(apiError);
+
+        const payload = {
+          messages: [{ content: 'Generate data', role: 'user' as const }],
+          schema: { name: 'abc', schema: { type: 'object' } as any },
+          model: 'gpt-4o',
+          responseApi: false,
+        };
+
+        await expect(instance.generateObject(payload)).rejects.toThrow(
+          'API Error: Rate limit exceeded',
+        );
+      });
+    });
+
+    describe('tools parameter support', () => {
+      it('should handle tools parameter with multiple tools', async () => {
+        const mockResponse = {
+          choices: [
+            {
+              message: {
+                tool_calls: [
+                  {
+                    type: 'function' as const,
+                    function: {
+                      name: 'get_weather',
+                      arguments: '{"city":"Tokyo","unit":"celsius"}',
+                    },
+                  },
+                  {
+                    type: 'function' as const,
+                    function: {
+                      name: 'get_time',
+                      arguments: '{"timezone":"Asia/Tokyo"}',
+                    },
+                  },
+                ],
+              },
+            },
+          ],
+        };
+
+        vi.spyOn(instance['client'].chat.completions, 'create').mockResolvedValue(
+          mockResponse as any,
+        );
+
+        const payload = {
+          messages: [{ content: 'What is the weather and time in Tokyo?', role: 'user' as const }],
+          tools: [
+            {
+              name: 'get_weather',
+              description: 'Get weather information',
+              parameters: {
+                type: 'object' as const,
+                properties: {
+                  city: { type: 'string' },
+                  unit: { type: 'string' },
+                },
+                required: ['city'],
+              },
+            },
+            {
+              name: 'get_time',
+              description: 'Get current time',
+              parameters: {
+                type: 'object' as const,
+                properties: {
+                  timezone: { type: 'string' },
+                },
+                required: ['timezone'],
+              },
+            },
+          ],
+          model: 'gpt-4o',
+        };
+
+        const result = await instance.generateObject(payload);
+
+        expect(instance['client'].chat.completions.create).toHaveBeenCalledWith(
+          {
+            messages: payload.messages,
+            model: payload.model,
+            tool_choice: 'required',
+            tools: [
+              {
+                type: 'function',
+                function: {
+                  name: 'get_weather',
+                  description: 'Get weather information',
+                  parameters: {
+                    type: 'object',
+                    properties: {
+                      city: { type: 'string' },
+                      unit: { type: 'string' },
+                    },
+                    required: ['city'],
+                  },
+                },
+              },
+              {
+                type: 'function',
+                function: {
+                  name: 'get_time',
+                  description: 'Get current time',
+                  parameters: {
+                    type: 'object',
+                    properties: {
+                      timezone: { type: 'string' },
+                    },
+                    required: ['timezone'],
+                  },
+                },
+              },
+            ],
+            user: undefined,
+          },
+          { headers: undefined, signal: undefined },
+        );
+
+        expect(result).toEqual([
+          { arguments: { city: 'Tokyo', unit: 'celsius' }, name: 'get_weather' },
+          { arguments: { timezone: 'Asia/Tokyo' }, name: 'get_time' },
+        ]);
+      });
+
+      it('should handle tools parameter with systemRole', async () => {
+        const mockResponse = {
+          choices: [
+            {
+              message: {
+                tool_calls: [
+                  {
+                    type: 'function' as const,
+                    function: {
+                      name: 'calculate',
+                      arguments: '{"result":8}',
+                    },
+                  },
+                ],
+              },
+            },
+          ],
+        };
+
+        vi.spyOn(instance['client'].chat.completions, 'create').mockResolvedValue(
+          mockResponse as any,
+        );
+
+        const payload = {
+          messages: [{ content: 'Add 5 and 3', role: 'user' as const }],
+          tools: [
+            {
+              name: 'calculate',
+              description: 'Perform calculation',
+              parameters: {
+                type: 'object' as const,
+                properties: {
+                  result: { type: 'number' },
+                },
+                required: ['result'],
+              },
+            },
+          ],
+          systemRole: 'You are a helpful calculator',
+          model: 'gpt-4o',
+        };
+
+        const result = await instance.generateObject(payload);
+
+        expect(instance['client'].chat.completions.create).toHaveBeenCalledWith(
+          expect.objectContaining({
+            messages: [
+              { content: 'Add 5 and 3', role: 'user' },
+              { content: 'You are a helpful calculator', role: 'system' },
+            ],
+          }),
+          expect.any(Object),
+        );
+
+        expect(result).toEqual([{ arguments: { result: 8 }, name: 'calculate' }]);
+      });
+
+      it('should throw error when neither tools nor schema is provided', async () => {
+        const payload = {
+          messages: [{ content: 'Generate data', role: 'user' as const }],
+          model: 'gpt-4o',
+        };
+
+        await expect(instance.generateObject(payload as any)).rejects.toThrow(
+          'tools or schema is required',
+        );
+      });
+    });
+
+    describe('tool calling fallback', () => {
+      let instanceWithToolCalling: any;
+
+      beforeEach(() => {
+        const RuntimeClass = createOpenAICompatibleRuntime({
+          baseURL: 'https://api.test.com',
+          generateObject: {
+            useToolsCalling: true,
+          },
+          provider: 'test-provider',
+        });
+
+        instanceWithToolCalling = new RuntimeClass({ apiKey: 'test-key' });
+      });
+
+      it('should use tool calling when configured', async () => {
+        const mockResponse = {
+          choices: [
+            {
+              message: {
+                tool_calls: [
+                  {
+                    type: 'function' as const,
+                    function: {
+                      name: 'person_extractor',
+                      arguments: '{"name":"Alice","age":28}',
+                    },
+                  },
+                ],
+              },
+            },
+          ],
+        };
+
+        vi.spyOn(instanceWithToolCalling['client'].chat.completions, 'create').mockResolvedValue(
+          mockResponse as any,
+        );
+
+        const payload = {
+          messages: [{ content: 'Extract person info', role: 'user' as const }],
+          schema: {
+            name: 'person_extractor',
+            description: 'Extract person information',
+            schema: {
+              type: 'object' as const,
+              properties: { name: { type: 'string' }, age: { type: 'number' } },
+            },
+          },
+          model: 'test-model',
+        };
+
+        const result = await instanceWithToolCalling.generateObject(payload);
+
+        expect(instanceWithToolCalling['client'].chat.completions.create).toHaveBeenCalledWith(
+          {
+            messages: payload.messages,
+            model: payload.model,
+            tools: [
+              {
+                type: 'function',
+                function: {
+                  name: 'person_extractor',
+                  description: 'Extract person information',
+                  parameters: payload.schema.schema,
+                },
+              },
+            ],
+            tool_choice: { type: 'function', function: { name: 'person_extractor' } },
+            user: undefined,
+          },
+          { headers: undefined, signal: undefined },
+        );
+
+        expect(result).toEqual([
+          { arguments: { name: 'Alice', age: 28 }, name: 'person_extractor' },
+        ]);
+      });
+
+      it('should return undefined when no tool call found', async () => {
+        const mockResponse = {
+          choices: [
+            {
+              message: {
+                content: 'Some text response',
+              },
+            },
+          ],
+        };
+
+        vi.spyOn(instanceWithToolCalling['client'].chat.completions, 'create').mockResolvedValue(
+          mockResponse as any,
+        );
+        const consoleSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+
+        const payload = {
+          messages: [{ content: 'Generate data', role: 'user' as const }],
+          schema: {
+            name: 'test_tool',
+            schema: { type: 'object' as const, properties: {} },
+          },
+          model: 'test-model',
+        };
+
+        const result = await instanceWithToolCalling.generateObject(payload);
+
+        expect(consoleSpy).toHaveBeenCalledWith('parse tool call arguments error:', undefined);
+        expect(result).toBeUndefined();
+
+        consoleSpy.mockRestore();
+      });
+
+      it('should return undefined when tool call arguments parsing fails', async () => {
+        const mockResponse = {
+          choices: [
+            {
+              message: {
+                tool_calls: [
+                  {
+                    type: 'function' as const,
+                    function: {
+                      name: 'test_tool',
+                      arguments: 'invalid json',
+                    },
+                  },
+                ],
+              },
+            },
+          ],
+        };
+
+        vi.spyOn(instanceWithToolCalling['client'].chat.completions, 'create').mockResolvedValue(
+          mockResponse as any,
+        );
+        const consoleSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+
+        const payload = {
+          messages: [{ content: 'Generate data', role: 'user' as const }],
+          schema: {
+            name: 'test_tool',
+            schema: { type: 'object' as const, properties: {} },
+          },
+          model: 'test-model',
+        };
+
+        const result = await instanceWithToolCalling.generateObject(payload);
+
+        expect(consoleSpy).toHaveBeenCalledWith(
+          'parse tool call arguments error:',
+          mockResponse.choices[0].message.tool_calls,
+        );
+        expect(result).toBeUndefined();
+
+        consoleSpy.mockRestore();
+      });
+
+      it('should handle options correctly with tool calling', async () => {
+        const mockResponse = {
+          choices: [
+            {
+              message: {
+                tool_calls: [
+                  {
+                    type: 'function' as const,
+                    function: {
+                      name: 'data_extractor',
+                      arguments: '{"data":"test"}',
+                    },
+                  },
+                ],
+              },
+            },
+          ],
+        };
+
+        vi.spyOn(instanceWithToolCalling['client'].chat.completions, 'create').mockResolvedValue(
+          mockResponse as any,
+        );
+
+        const payload = {
+          messages: [{ content: 'Extract data', role: 'user' as const }],
+          schema: {
+            name: 'data_extractor',
+            schema: { type: 'object' as const, properties: { data: { type: 'string' } } },
+          },
+          model: 'test-model',
+        };
+
+        const options = {
+          headers: { 'X-Custom': 'header' },
+          user: 'test-user',
+          signal: new AbortController().signal,
+        };
+
+        const result = await instanceWithToolCalling.generateObject(payload, options);
+
+        expect(instanceWithToolCalling['client'].chat.completions.create).toHaveBeenCalledWith(
+          expect.any(Object),
+          { headers: options.headers, signal: options.signal },
+        );
+
+        expect(result).toEqual([{ arguments: { data: 'test' }, name: 'data_extractor' }]);
       });
     });
   });

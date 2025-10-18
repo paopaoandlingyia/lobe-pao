@@ -6,7 +6,7 @@ import {
 import type { Stream } from 'openai/streaming';
 
 import { ChatStreamCallbacks } from '../../types';
-import { convertUsage } from '../../utils/usageConverter';
+import { convertOpenAIUsage } from '../usageConverters';
 import {
   StreamContext,
   StreamProtocolChunk,
@@ -24,7 +24,7 @@ export const transformQwenStream = (
   streamContext?: StreamContext,
 ): StreamProtocolChunk | StreamProtocolChunk[] => {
   if (Array.isArray(chunk.choices) && chunk.choices.length === 0 && chunk.usage) {
-    const usage = convertUsage({
+    const usage = convertOpenAIUsage({
       ...chunk.usage,
       completion_tokens_details: chunk.usage.completion_tokens_details || {},
       prompt_tokens_details: chunk.usage.prompt_tokens_details || {},
@@ -116,7 +116,11 @@ export const QwenAIStream = (
   stream: Stream<OpenAI.ChatCompletionChunk> | ReadableStream,
   // TODO: preserve for RFC 097
   // eslint-disable-next-line @typescript-eslint/no-unused-vars, unused-imports/no-unused-vars
-  { callbacks, inputStartAt }: { callbacks?: ChatStreamCallbacks; inputStartAt?: number } = {},
+  {
+    callbacks,
+    inputStartAt,
+    enableStreaming = true,
+  }: { callbacks?: ChatStreamCallbacks; enableStreaming?: boolean; inputStartAt?: number } = {},
 ) => {
   const streamContext: StreamContext = { id: '' };
   const readableStream =
@@ -124,7 +128,11 @@ export const QwenAIStream = (
 
   return readableStream
     .pipeThrough(
-      createTokenSpeedCalculator(transformQwenStream, { inputStartAt, streamStack: streamContext }),
+      createTokenSpeedCalculator(transformQwenStream, {
+        enableStreaming: enableStreaming,
+        inputStartAt,
+        streamStack: streamContext,
+      }),
     )
     .pipeThrough(createSSEProtocolTransformer((c) => c, streamContext))
     .pipeThrough(createCallbacksTransformer(callbacks));

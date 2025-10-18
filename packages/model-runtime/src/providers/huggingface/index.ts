@@ -1,11 +1,13 @@
 import { HfInference } from '@huggingface/inference';
+import type { ChatModelCard } from '@lobechat/types';
+import { ModelProvider } from 'model-bank';
 import urlJoin from 'url-join';
 
-import type { ChatModelCard } from '@/types/llm';
-
-import { createOpenAICompatibleRuntime } from '../../core/openaiCompatibleFactory';
+import {
+  OpenAICompatibleFactoryOptions,
+  createOpenAICompatibleRuntime,
+} from '../../core/openaiCompatibleFactory';
 import { convertIterableToStream } from '../../core/streams';
-import { ModelProvider } from '../../types';
 import { AgentRuntimeErrorType } from '../../types/error';
 
 export interface HuggingFaceModelCard {
@@ -13,7 +15,7 @@ export interface HuggingFaceModelCard {
   tags: string[];
 }
 
-export const LobeHuggingFaceAI = createOpenAICompatibleRuntime({
+export const params = {
   chatCompletion: {
     handleStreamBizErrorType: (error) => {
       // e.g.: Server meta-llama/Meta-Llama-3.1-8B-Instruct does not seem to support chat completion. Error: Model requires a Pro subscription; check out hf.co/pricing to learn more. Make sure to include your HF token in your query.
@@ -61,7 +63,7 @@ export const LobeHuggingFaceAI = createOpenAICompatibleRuntime({
 
     const reasoningKeywords = ['deepseek-r1', 'qvq', 'qwq'];
 
-    // ref: https://huggingface.co/docs/hub/api
+    // ref: https://huggingface.co/api/models
     const url = 'https://huggingface.co/api/models';
     const response = await fetch(url, {
       method: 'GET',
@@ -101,4 +103,6 @@ export const LobeHuggingFaceAI = createOpenAICompatibleRuntime({
       .filter(Boolean) as ChatModelCard[];
   },
   provider: ModelProvider.HuggingFace,
-});
+} satisfies OpenAICompatibleFactoryOptions;
+
+export const LobeHuggingFaceAI = createOpenAICompatibleRuntime(params);

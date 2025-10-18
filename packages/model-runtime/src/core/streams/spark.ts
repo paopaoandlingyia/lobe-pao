@@ -2,7 +2,7 @@ import OpenAI from 'openai';
 import type { Stream } from 'openai/streaming';
 
 import { ChatStreamCallbacks } from '../../types';
-import { convertUsage } from '../../utils/usageConverter';
+import { convertOpenAIUsage } from '../usageConverters';
 import {
   StreamProtocolChunk,
   StreamProtocolToolCallChunk,
@@ -50,7 +50,16 @@ export function transformSparkResponseToStream(data: OpenAI.ChatCompletion) {
       };
 
       controller.enqueue(chunk);
-
+      if (data.usage) {
+        controller.enqueue({
+          choices: [],
+          created: data.created,
+          id: data.id,
+          model: data.model,
+          object: 'chat.completion.chunk',
+          usage: data.usage,
+        } as unknown as OpenAI.ChatCompletionChunk);
+      }
       controller.enqueue({
         choices: choices.map((choice: OpenAI.ChatCompletion.Choice) => ({
           delta: {
@@ -126,7 +135,7 @@ export const transformSparkStream = (chunk: OpenAI.ChatCompletionChunk): StreamP
     if (chunk.usage) {
       return [
         { data: item.delta.content, id: chunk.id, type: 'text' },
-        { data: convertUsage(chunk.usage), id: chunk.id, type: 'usage' },
+        { data: convertOpenAIUsage(chunk.usage), id: chunk.id, type: 'usage' },
       ] as any;
     }
 
@@ -139,7 +148,7 @@ export const transformSparkStream = (chunk: OpenAI.ChatCompletionChunk): StreamP
 
   // 处理 v2 endpoint usage
   if (chunk.usage) {
-    return { data: convertUsage(chunk.usage), id: chunk.id, type: 'usage' };
+    return { data: convertOpenAIUsage(chunk.usage), id: chunk.id, type: 'usage' };
   }
 
   return {

@@ -25,16 +25,22 @@ export enum ChatSettingsTabs {
   TTS = 'tts',
 }
 
+export enum GroupSettingsTabs {
+  Chat = 'chat',
+  Members = 'members',
+  Settings = 'settings',
+}
+
 export enum SettingsTabs {
   About = 'about',
   Agent = 'agent',
   Common = 'common',
   Hotkey = 'hotkey',
+  Image = 'image',
   LLM = 'llm',
   Provider = 'provider',
   Proxy = 'proxy',
   Storage = 'storage',
-  Sync = 'sync',
   SystemAgent = 'system-agent',
   TTS = 'tts',
 }

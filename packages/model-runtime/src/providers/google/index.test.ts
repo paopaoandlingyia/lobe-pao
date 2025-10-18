@@ -1,14 +1,15 @@
 // @vitest-environment edge-runtime
 import { GenerateContentResponse, Tool } from '@google/genai';
 import { OpenAIChatMessage } from '@lobechat/model-runtime';
+import { ChatStreamPayload } from '@lobechat/types';
 import OpenAI from 'openai';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-import { ChatStreamPayload } from '@/types/openai/chat';
-
+import { LOBE_ERROR_KEY } from '../../core/streams';
+import { AgentRuntimeErrorType } from '../../types/error';
 import * as debugStreamModule from '../../utils/debugStream';
 import * as imageToBase64Module from '../../utils/imageToBase64';
-import { LobeGoogleAI } from './index';
+import { LobeGoogleAI, resolveModelThinkingBudget } from './index';
 
 const provider = 'google';
 const bizErrorType = 'ProviderBizError';
@@ -825,5 +826,196 @@ describe('LobeGoogleAI', () => {
         });
       });
     });
+
+    describe('createEnhancedStream', () => {
+      it('should handle stream cancellation with data gracefully', async () => {
+        const mockStream = (async function* () {
+          yield { text: 'Hello' };
+          yield { text: ' world' };
+        })();
+
+        const abortController = new AbortController();
+        const enhancedStream = instance['createEnhancedStream'](mockStream, abortController.signal);
+
+        const reader = enhancedStream.getReader();
+        const chunks: any[] = [];
+
+        // Read first value then cancel to trigger error chunk
+        chunks.push((await reader.read()).value);
+        abortController.abort();
+
+        // Read all remaining chunks
+        let result;
+        while (!(result = await reader.read()).done) {
+          chunks.push(result.value);
+        }
+
+        // Batch-assert the entire chunks array
+        expect(chunks).toEqual([
+          { text: 'Hello' },
+          {
+            [LOBE_ERROR_KEY]: {
+              body: { name: 'Stream cancelled', provider, reason: 'aborted' },
+              message: 'Stream cancelled',
+              name: 'Stream cancelled',
+              type: AgentRuntimeErrorType.StreamChunkError,
+            },
+          },
+        ]);
+      });
+
+      it('should handle stream cancellation without data', async () => {
+        const mockStream = (async function* () {
+          // Empty stream
+        })();
+
+        const abortController = new AbortController();
+        const enhancedStream = instance['createEnhancedStream'](mockStream, abortController.signal);
+
+        const reader = enhancedStream.getReader();
+
+        // Cancel immediately
+        abortController.abort();
+
+        // Should be closed without any chunks
+        const chunk = await reader.read();
+        expect(chunk.done).toBe(true);
+      });
+
+      it('should handle AbortError with data', async () => {
+        const mockStream = (async function* () {
+          yield { text: 'Hello' };
+          throw new Error('aborted');
+        })();
+
+        const abortController = new AbortController();
+        const enhancedStream = instance['createEnhancedStream'](mockStream, abortController.signal);
+
+        const reader = enhancedStream.getReader();
+        const chunks: any[] = [];
+
+        // Read first value then collect remaining chunks (error included)
+        chunks.push((await reader.read()).value);
+        let result;
+        while (!(result = await reader.read()).done) {
+          chunks.push(result.value);
+        }
+
+        // Assert both data and error chunk together
+        expect(chunks).toEqual([
+          { text: 'Hello' },
+          {
+            [LOBE_ERROR_KEY]: {
+              body: { name: 'Stream cancelled', provider, reason: 'aborted' },
+              message: 'Stream cancelled',
+              name: 'Stream cancelled',
+              type: AgentRuntimeErrorType.StreamChunkError,
+            },
+          },
+        ]);
+      });
+
+      it('should handle AbortError without data', async () => {
+        const mockStream = (async function* () {
+          throw new Error('aborted');
+        })();
+
+        const abortController = new AbortController();
+        const enhancedStream = instance['createEnhancedStream'](mockStream, abortController.signal);
+
+        const reader = enhancedStream.getReader();
+        const chunks: any[] = [];
+
+        // Read error chunk
+        const chunk1 = await reader.read();
+        chunks.push(chunk1.value);
+
+        // Stream should be closed
+        const chunk2 = await reader.read();
+        expect(chunk2.done).toBe(true);
+
+        expect(chunks[0][LOBE_ERROR_KEY]).toEqual({
+          body: {
+            message: 'aborted',
+            name: 'AbortError',
+            provider,
+            stack: expect.any(String),
+          },
+          message: 'aborted',
+          name: 'AbortError',
+          type: AgentRuntimeErrorType.StreamChunkError,
+        });
+      });
+
+      it('should handle other stream parsing errors', async () => {
+        const mockStream = (async function* () {
+          yield { text: 'Hello' };
+          throw new Error('Network error');
+        })();
+
+        const abortController = new AbortController();
+        const enhancedStream = instance['createEnhancedStream'](mockStream, abortController.signal);
+
+        const reader = enhancedStream.getReader();
+        const chunks: any[] = [];
+
+        // Read first value then collect remaining chunks (parsing error)
+        chunks.push((await reader.read()).value);
+        let result;
+        while (!(result = await reader.read()).done) {
+          chunks.push(result.value);
+        }
+
+        expect(chunks).toEqual([
+          { text: 'Hello' },
+          {
+            [LOBE_ERROR_KEY]: {
+              body: { message: 'Network error', provider },
+              message: 'Network error',
+              name: 'Stream parsing error',
+              type: AgentRuntimeErrorType.ProviderBizError,
+            },
+          },
+        ]);
+      });
+    });
+  });
+});
+
+describe('resolveModelThinkingBudget', () => {
+  it('returns dynamic defaults for 2.5 pro models', () => {
+    expect(resolveModelThinkingBudget('gemini-2.5-pro')).toBe(-1);
+  });
+
+  it('clamps manual budgets for 2.5 pro models', () => {
+    expect(resolveModelThinkingBudget('gemini-2.5-pro', 0)).toBe(128);
+    expect(resolveModelThinkingBudget('gemini-2.5-pro', 40_000)).toBe(32_768);
+  });
+
+  it('supports disabling and dynamic thinking for flash models', () => {
+    expect(resolveModelThinkingBudget('gemini-2.5-flash')).toBe(-1);
+    expect(resolveModelThinkingBudget('gemini-2.5-flash', 0)).toBe(0);
+    expect(resolveModelThinkingBudget('gemini-2.5-flash', -1)).toBe(-1);
+    expect(resolveModelThinkingBudget('gemini-2.5-flash', -5)).toBe(0);
+    expect(resolveModelThinkingBudget('gemini-2.5-flash-preview', 30_000)).toBe(24_576);
+  });
+
+  it('enforces flash lite family defaults and ranges', () => {
+    expect(resolveModelThinkingBudget('gemini-2.5-flash-lite')).toBe(0);
+    expect(resolveModelThinkingBudget('gemini-2.5-flash-lite', 400)).toBe(512);
+    expect(resolveModelThinkingBudget('gemini-2.5-flash-lite', 600)).toBe(600);
+    expect(resolveModelThinkingBudget('gemini-2.5-flash-lite-preview', 25_000)).toBe(24_576);
+  });
+
+  it('applies robotics preview defaults and overrides', () => {
+    expect(resolveModelThinkingBudget('robotics-er-1.5-preview')).toBe(0);
+    expect(resolveModelThinkingBudget('robotics-er-1.5-preview', -1)).toBe(-1);
+    expect(resolveModelThinkingBudget('robotics-er-1.5-preview', 256)).toBe(512);
+  });
+
+  it('falls back to generic behaviour for other models', () => {
+    expect(resolveModelThinkingBudget('unknown-model')).toBeUndefined();
+    expect(resolveModelThinkingBudget('unknown-model', 999)).toBe(999);
+    expect(resolveModelThinkingBudget('unknown-model', 99_999)).toBe(24_576);
   });
 });
